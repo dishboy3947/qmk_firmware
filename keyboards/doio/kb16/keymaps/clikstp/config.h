@@ -8,5 +8,5 @@
 // The OLED turns off after this long without a key or encoder interaction.
 #define OLED_TIMEOUT 90000
 
-#define WS2818_BITBANG_NOP_FUDGE 0.21     // middle of the working range
+#define WS2812_BITBANG_NOP_FUDGE 0.21     // middle of the working range
 #define WS2812_TIMING 1650                // longer low phases: 1 bit low 2 loops, 0 bit low 4
