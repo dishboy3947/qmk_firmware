@@ -157,6 +157,16 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
             break;
         }
 
+        case MSG_LAYER:
+            // [0]=MSG_LAYER [1]=layer (0 = normal, 2 = FlightDirector)
+            // app interaction can toggle like a TT(5) would do on this firmware
+            // performed via layer_state_set_user function.
+            if (length < 2) break;
+            if (data[1] == _FD) layer_on(_FD);
+            else layer_off(_FD);
+            note_host();
+            break;
+
         case MSG_FEEDBACK:
             // reserved: per-tool RGB colour
             break;
