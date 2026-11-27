@@ -21,9 +21,12 @@
  *
  * Everything goes to the CLIKSTP app over Raw HID; the pad itself types nothing.
  *   - Encoders: turns and presses, as before (controls 0 = left, 1 = right, 2 = big).
- *   - Keys 2..16: press and release (controls 17..31; key n is control 15 + n).
+ *   - Keys 2..4 and 6..16: press and release (controls 17..31; key n is control 15 + n).
  *   - Key 1: the RGB layer. Hold for momentary, double-tap to latch on, double-tap again to leave.
  *     In the RGB layer nothing is sent to the app: the encoders and keys adjust the lighting.
+ *   - Key 5: the FD (flight director) layer, held or latched the same way. Its keys report controls 33..47
+ *     (key n is control 31 + n); the encoders report as usual. The pad tells the app which layer it's in
+ *     (MSG_LAYER), so the app can switch to the FD tools.
  *   - Hold keys 13 and 16 together for 3 seconds: bootloader (for flashing), from the normal layer.
  *   - The OLED shows the app's text (the selected tool, and a readout) while the app is connected,
  *     "RGB" in the RGB layer, and the stock layer display otherwise.
@@ -43,10 +46,11 @@
 enum layer_names {
     _BASE,
     _RGB,
+    _FD,
 };
 
 // Message types (byte 0) and input events. Keep in step with HidProtocol in the app.
-enum { MSG_INPUT = 0x01, MSG_FEEDBACK = 0x02, MSG_HEARTBEAT = 0x03, MSG_DISPLAY = 0x04 };
+enum { MSG_INPUT = 0x01, MSG_FEEDBACK = 0x02, MSG_HEARTBEAT = 0x03, MSG_DISPLAY = 0x04, MSG_LAYER = 0x05 };
 enum { EVT_CW = 1, EVT_CCW = 2, EVT_PRESS = 3, EVT_RELEASE = 4 };
 
 // Key n (1..16) reports as control (KEY_CONTROL_BASE - 1 + n), i.e. 16..31.
@@ -64,7 +68,18 @@ enum custom_keycodes {
     ENC_BIG,
     PK_2, PK_3, PK_4, PK_5, PK_6, PK_7, PK_8, PK_9,
     PK_10, PK_11, PK_12, PK_13, PK_14, PK_15, PK_16,
+    // Flight Director layer keys, named by key like PK_.  FD_5_UNUSED keeps the range continuous (key 5 is the layer change key).
+    FD_2, FD_3, FD_4, FD_5_UNUSED, FD_6, FD_7, FD_8, FD_9,
+    FD_10, FD_11, FD_12, FD_13, FD_14, FD_15, FD_16,
 };
+
+// FD key n (2..16) reports as control (FD_CONTROL_BASE - 1 + n), i.e. 33..47 is the HID key range that
+// will be sent over the wire.
+#define FD_CONTROL_BASE 32
+
+static uint8_t fd_key_number(uint16_t keycode) {
+    return (keycode >= FD_2 && keycode <= FD_16) ? (uint8_t)(keycode - FD_2 + 2) : 0;
+}
 
 static uint8_t key_number(uint16_t keycode) {
     return (keycode >= PK_2 && keycode <= PK_16) ? (uint8_t)(keycode - PK_2 + 2) : 0;
@@ -87,13 +102,37 @@ static bool     display_dirty = true;
 static uint32_t host_seen     = 0;
 static bool     host_ever     = false;
 
+// --- They layer to describe to the Clikstp app which control set should be referenced ---
+// The layer the app switches tools on: FD or normal. RGB doesn't count as it's internal to the pad
+// and doesn't send commands over the channel.
+static uint8_t sent_layer = 0xFF;
+
+// [0]=MSG_LAYER [1]=layer (0 is normal, 2 is Flight Director).  Sent when it changes, or always with force (app reconnect).
+static void report_layer(layer_state_t state, bool force) {
+    uint8_t layer = layer_state_cmp(state, _FD) ? _FD : _BASE;
+    if (!force && layer == sent_layer) return;
+    sent_layer = layer;
+    uint8_t data[HID_PACKET_SIZE] = {0};
+    data[0] = MSG_LAYER;
+    data[1] = layer;
+    raw_hid_send(data, HID_PACKET_SIZE);
+}
+
+layer_state_t layer_state_set_user(layer_state_t state) {
+    report_layer(state, false);
+    display_dirty = true;  // the LED panel redraws to show the FD marker
+    return state;
+}
+
 static bool host_alive(void) {
     return host_ever && timer_elapsed32(host_seen) < HOST_TIMEOUT_MS;
 }
 
 static void note_host(void) {
+    bool was_alive = host_alive();
     host_seen = timer_read32();
     host_ever = true;
+    if (!was_alive) report_layer(layer_state, true);
 }
 
 void raw_hid_receive(uint8_t *data, uint8_t length) {
@@ -117,6 +156,16 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
             note_host();
             break;
         }
+
+        case MSG_LAYER:
+            // [0]=MSG_LAYER [1]=layer (0 = normal, 2 = FlightDirector)
+            // app interaction can toggle like a TT(5) would do on this firmware
+            // performed via layer_state_set_user function.
+            if (length < 2) break;
+            if (data[1] == _FD) layer_on(_FD);
+            else layer_off(_FD);
+            note_host();
+            break;
 
         case MSG_FEEDBACK:
             // reserved: per-tool RGB colour
@@ -157,6 +206,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     }
 
     uint8_t n = key_number(keycode);
+    uint8_t fd = fd_key_number(keycode);
     if (n) {
         // Bootloader chord: 13 + 16 held together (normal layer; in the RGB layer key 16 is brightness down).
         bool was_both = k13_down && k16_down;
@@ -165,6 +215,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         if (!was_both && k13_down && k16_down) boot_timer = timer_read();
 
         if (!layer_state_is(_RGB)) send_input(KEY_CONTROL_BASE - 1 + n, event, 1);
+        return false;
+    }
+    if (fd) {
+        send_input(FD_CONTROL_BASE - 1 + fd, event, 1);
         return false;
     }
     return true;
@@ -205,7 +259,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 */
     [_BASE] = LAYOUT(
                 TT(_RGB), PK_2,  PK_3,  PK_4,  ENC_L,
-                PK_5,     PK_6,  PK_7,  PK_8,  ENC_R,
+                TT(_FD),     PK_6,  PK_7,  PK_8,  ENC_R,
                 PK_9,     PK_10, PK_11, PK_12, ENC_BIG,
                 PK_13,    PK_14, PK_15, PK_16
             ),
@@ -225,9 +279,29 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 */
     [_RGB] = LAYOUT(
                 _______, RM_SPDU, RM_SPDD, EE_CLR,  RM_NEXT,
-                RM_SATU, RM_SATD, XXXXXXX, QK_BOOT, RM_PREV,
+                RM_SATU, RM_SATD, XXXXXXX, XXXXXXX, RM_PREV,
                 RM_TOGG, RM_NEXT, RM_HUEU, XXXXXXX, RM_TOGG,
                 XXXXXXX, RM_VALU, RM_HUED, RM_VALD
+            ),
+
+/*
+       FD layer: hold key 5, or double-tap it to latch (double-tap again to leave).
+       Keys 1 and 5 fall through (RGB and leaving still work); the encoders work as usual.
+       ┌─────┬──────┬──────┬─────┐   ┌───┐ ┌───┐
+       │ RGB │  AP  │  FD  │ YD  │   │ L │ │ R │     Keys report 33..47 (key n is control 31 + n);
+       ├─────┼──────┼──────┼─────┤   └───┘ └───┘     what they do is up to the app.
+       │  L  │ HDG  │ NAV  │ APR │
+       ├─────┼──────┼──────┼─────┤
+       │ ALT │  VS  │ FLC  │ BC  │      ┌───┐
+       ├─────┼──────┼──────┼─────┤      │Big│
+       │ VNV │ NoUp │ NoDn │ 16  │      └───┘
+       └─────┴──────┴──────┴─────┘
+*/
+    [_FD] = LAYOUT(
+                _______,  FD_2,  FD_3,  FD_4,  ENC_L,
+                _______,  FD_6,  FD_7,  FD_8,  ENC_R,
+                FD_9,     FD_10, FD_11, FD_12, ENC_BIG,
+                FD_13,    FD_14, FD_15, FD_16
             ),
 };
 
@@ -252,7 +326,7 @@ static void write_row(uint8_t row, const char *text) {
 
 static void render_app(void) {
     if (!display_dirty) return;
-    write_row(0, "");
+    write_row(0, layer_state_is(_FD) ? "FD / AP mode" : "");
     write_row(1, display_text[0]);   // the selected tool
     write_row(2, "");
     write_row(3, display_text[1]);   // its readout, if any
